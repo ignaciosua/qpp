@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Model checkpoints & large binaries
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.onnx
+
+# Outputs (large experiment results)
+outputs/*
+!outputs/.gitkeep
+!outputs/README.md
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# matplotlib
+/tmp/matplotlib-*
+
+# HuggingFace cache (local)
+.cache/

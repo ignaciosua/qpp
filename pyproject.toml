@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qpp-compression"
+version = "0.1.0"
+description = "QPP: Quantile Piecewise Perceptron — parametric compression for LLM attention layers"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Ignacio Fernando Suárez Hernández", email = "ignaciosua@gmail.com" },
+]
+keywords = [
+    "llm", "compression", "quantization", "qpp", "attention",
+    "deep-learning", "pytorch", "transformers",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+hf = [
+    "transformers>=4.40",
+    "safetensors>=0.4",
+]
+dev = [
+    "pytest>=7",
+    "pytest-cov",
+    "matplotlib>=3.7",
+    "pandas>=1.5",
+    "scipy>=1.10",
+]
+all = [
+    "qpp-compression[hf,dev]",
+]
+
+[project.scripts]
+qpp-compress = "qpp.hybrid:main_cli"
+qpp-benchmark = "qpp.benchmark:main_cli"
+
+[project.urls]
+Homepage = "https://github.com/ignaciosua/qpp"
+Repository = "https://github.com/ignaciosua/qpp.git"
+Paper = "https://github.com/ignaciosua/qpp/blob/main/paper/qpp_paper.pdf"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"

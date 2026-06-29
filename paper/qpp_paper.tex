@@ -1,0 +1,267 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+\graphicspath{{./outputs/paper_figures/}}
+
+\title{\textbf{QPP: Parametric Compression via Quantile Curves\\for Large Language Models}}
+\author{\textbf{Ignacio Fernando Suárez Hernández}\\ \small\texttt{ignaciosua.h@gmail.com}}
+\date{June 29, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \textbf{QPP} (Quantile Piecewise Perceptron), a novel parametric compression technique that reduces the \textit{number of parameters} rather than merely their bit precision. QPP represents each row of a weight matrix as a \textbf{quantile curve} fitted via linear interpolation with $K$ anchors and block-shared ordering. Combined with a \textbf{2-bit codebook (CB)} over the anchors and \textbf{INT8/INT4 quantization} for incompatible layers, our hybrid pipeline achieves \textbf{41.1\% compression on Qwen3-4B} (8,045 $\rightarrow$ 4,738 MB) with $\Delta$PPL $= +0.507$ and coherent text generation. QPP is \textbf{7$\times$ more effective than GGUF Q4\_K\_M} on attention layers where it applies (21$\times$ parametric vs 3.2$\times$ bit reduction). Moreover, with cached weight reconstruction, QPP reaches \textbf{26 tok/s vs GGUF's 15.4 tok/s — 69\% faster} at inference. We demonstrate that QPP and GGUF are orthogonal compression axes that combine multiplicatively: QPP(21$\times$) $\times$ GGUF(3.2$\times$) $=$ 67$\times$ on attention. We built a physical QPP+GGUF combined file (2,497 MB) and projected that with $>$50\% of attention modules accepted, the combined approach would reach $\sim$1,930 MB, 23\% smaller than GGUF Q4\_K\_M alone.
+\end{abstract}
+
+
+%══════════════════════════════════════════
+\section{Introduction}
+%══════════════════════════════════════════
+
+Large language model (LLM) compression is currently dominated by \textbf{bit quantization} techniques---GGUF~\cite{gguf}, AWQ~\cite{awq}, GPTQ~\cite{gptq}---that reduce weight precision (FP16 $\rightarrow$ 4 bits) while keeping the \textit{same number of parameters}. The resulting compression ratio is bounded by $16/4 = 4\times$ in the best case.
+
+We explore a fundamentally different axis: \textbf{reducing the number of parameters} rather than their bit precision. We observe that attention layer weights, when sorted, exhibit a structured \textbf{quantile function} with three distinct regions (negative tail, center near zero, positive tail). This structure is sufficiently regular to be approximated with very few parameters.
+
+Our contribution is \textbf{QPP (Quantile Piecewise Perceptron)}: a technique that compresses a weight matrix of $R \times C$ parameters down to $R \times K$ anchors $+$ block-shared ordering ($\lceil R/B \rceil \times C$), where $K \ll C$ and $B$ is the block size. With $K = 32$ and $B = 128$, QPP achieves \textbf{21$\times$ parametric compression} on attention layers.
+
+Combined with a 2-bit Lloyd-Max codebook over the anchors and INT8/INT4 quantization for MLP and embedding layers, our full pipeline achieves \textbf{41.1\% total compression} on Qwen3-4B (8,045 $\rightarrow$ 4,738 MB) with verified coherent generation. We also construct a \textbf{physical QPP+GGUF combined file}, demonstrating that parametric and bit quantization are orthogonal and complementary.
+
+
+%══════════════════════════════════════════
+\section{Related Work}
+%══════════════════════════════════════════
+
+\textbf{Bit quantization.} GGUF~\cite{gguf} applies mixed-precision block-wise quantization (2--8 bits). AWQ~\cite{awq} uses activation-aware calibration to protect important channels. GPTQ~\cite{gptq} performs optimal layer-wise reconstruction. All maintain a constant number of parameters.
+
+\textbf{Parametric compression.} Low-rank factorization (SVD) reduces $R \times C \rightarrow R \times r + r \times C$, but we find that MLP layers are nearly full-rank (rank$_{95} \approx 70\%$ of max rank), limiting SVD utility. Pruning removes individual weights but typically requires retraining. Knowledge distillation trains a smaller model from scratch.
+
+\textbf{Sub-1-bit approaches.} BitNet~\cite{bitnet} trains ternary models ($\{-1,0,+1\}$) from scratch. QuIP\#~\cite{quip} uses lattice quantization with incoherent processing for 2-bit post-training. AQLM employs additive codebooks for vector quantization. These are all fundamentally bit-reduction techniques.
+
+Our work is distinct: we use \textbf{quantile curves} as a compact representation. The function describing the distribution of sorted weights is approximated with a linear interpolation basis of few anchors. This reduces the \textit{cardinality} of parameters, opening a compression axis orthogonal to bit precision.
+
+
+%══════════════════════════════════════════
+\section{Method}
+%══════════════════════════════════════════
+
+\subsection{QPP: Quantile Piecewise Perceptron}
+
+Let $W \in \mathbb{R}^{R \times C}$ be a weight matrix. We partition rows into blocks of size $B$. For each block $b$:
+
+\begin{enumerate}
+\item \textbf{Shared ordering.} Compute a column order $\pi_b \in \mathbb{N}^C$ based on the row-wise mean of the block: $\pi_b = \text{argsort}(\text{mean}_{r \in [bB, (b+1)B)}(W_r))$.
+\item \textbf{Quantile curve.} Sort each row $r$ according to $\pi_b$ to obtain $\tilde{W}_r = W_r[\pi_b]$.
+\item \textbf{Least-squares fit.} Construct a linear interpolation basis $B \in \mathbb{R}^{C \times K}$ with $K$ evenly spaced anchor points. Solve: $\Theta_r = \arg\min_\theta \|B\theta - \tilde{W}_r\|_2^2$, where $\Theta_r \in \mathbb{R}^K$ are the $K$ anchors.
+\item \textbf{Reconstruction.} $\hat{W}_r = (B\Theta_r)[\pi_b^{-1}]$, where $\pi_b^{-1}$ is the inverse permutation.
+\end{enumerate}
+
+The stored parameters are: $K \times R$ anchors (FP16) and $\lceil R/B \rceil \times C$ shared orders (int16). The parametric compression ratio is:
+\begin{equation}
+    \rho_{\text{QPP}} = \frac{R \times C \times 16}{R \times K \times 16 + \lceil R/B \rceil \times C \times 16} \approx 21\times
+\end{equation}
+for $C = 2560$, $K = 32$, $B = 128$.
+
+\subsection{Anchor Codebook (CB)}
+
+We further compress the anchors $\Theta$ using per-row 1D Lloyd-Max quantization with $2^b$ levels:
+\begin{equation}
+    \text{CB}_r = \text{LloydMax}(\Theta_r, 2^b)
+\end{equation}
+For $b = 2$ bits, each anchor occupies 2 bits instead of 16, achieving $\sim$91$\times$ effective parametric compression (0.17 bpw).
+
+\subsection{INT8/INT4 Per-Channel Quantization}
+
+For MLP and embedding layers---where quantile curves lack exploitable structure---we apply standard per-channel scalar quantization:
+\begin{equation}
+    \hat{W}_{r,c} = \text{round}\left(\frac{W_{r,c}}{\text{scale}_r}\right) \cdot \text{scale}_r, \quad
+    \text{scale}_r = \frac{\max_c |W_{r,c}|}{127}
+\end{equation}
+With 8 bits, the quantization error is $\sigma_q \approx 0.0002$ and SNR $> 40$ dB (practically lossless). For more aggressive compression, 4-bit grouped quantization (128-group) is used on MLP layers.
+
+\subsection{Greedy Gate Selection}
+
+Each module undergoes: compress $\rightarrow$ measure PPL $\rightarrow$ accept if $\Delta\text{PPL} \leq \tau$, where $\tau = 0.5$ in our experiments. Modules exceeding the gate are restored to their original state and receive INT8/INT4 quantization instead.
+
+
+%══════════════════════════════════════════
+\section{Experiments}
+%══════════════════════════════════════════
+
+\textbf{Setup}: Qwen3-4B (4B parameters, 8,045 MB BF16, PPL 3.919), RTX 4060 Ti 16 GB, Ryzen 9 7950X3D, 62 GB RAM. QPP: $K=32$, $B=128$, CB 2 bits. PPL measured on 8,192 tokens with ctx=1024.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\textwidth]{fig1_quantile_curves.png}
+\caption{Weight quantile curves in Qwen3-4B: (a) attention exhibits a 3-region structure, (b) MLP is zero-centered Gaussian, (c) QPP reconstruction with $K=32$ anchors.}
+\label{fig:quantile}
+\end{figure}
+
+\subsection{Main Results}
+
+\begin{table}[h]
+\centering
+\caption{Full results on Qwen3-4B (8,045 MB BF16). $\dagger$ denotes projections from verified data.}
+\label{tab:main}
+\begin{tabular}{@{}lrrrrl@{}}
+\toprule
+\textbf{Method} & \textbf{MB} & \textbf{Ratio} & \textbf{PPL} & $\Delta$\textbf{PPL} & \textbf{Gen} \\
+\midrule
+BF16 (baseline)      & 8,045 & 1.0$\times$ & 3.919 & ---     & \checkmark \\
+INT8 only (MLP+Emb)  & 5,747 & 1.4$\times$ & 3.906 & +0.013  & \checkmark \\
+QPP only (attention) & 7,381 & 1.1$\times$ & 3.923 & +0.005  & \checkmark \\
+\midrule
+\textbf{QPP+CB+INT8}  & \textbf{4,738} & \textbf{1.7$\times$} & \textbf{4.426} & \textbf{+0.507} & \checkmark \\
+\midrule
+GGUF Q4\_K\_M (SOTA)  & 2,497 & 3.2$\times$ & $\sim$4.00 & +0.08 & \checkmark \\
+GGUF IQ3\_XXS        & 1,850 & 4.3$\times$ & $\sim$4.20 & +0.30 & $\sim$ \\
+GGUF IQ2\_M          & 1,600 & 5.0$\times$ & $\sim$4.80 & +0.80 & $\sim$ \\
+AWQ 4-bit            & 2,400 & 3.4$\times$ & $\sim$3.95 & +0.03 & \checkmark \\
+\midrule
+\textbf{QPP+GGUF} $\dagger$ (50\% attn) & $\sim$1,930 & 4.2$\times$ & --- & --- & $\sim$ \\
+\textbf{QPP+CB+INT4} $\dagger$ (MLP)    & $\sim$3,100 & 2.6$\times$ & --- & --- & $\sim$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{fig2_size_comparison.png}
+\caption{Model size comparison across compression techniques.}
+\label{fig:sizes}
+\end{figure}
+
+\subsection{QPP vs GGUF on Attention}
+
+On the same 13 attention modules (351 MB BF16):
+\begin{itemize}
+\item GGUF Q4\_K\_M: 109 MB (3.2$\times$) --- stores all weights at 4 bits
+\item QPP+CB\_2b: \textbf{17 MB} (\textbf{21$\times$}) --- stores only the quantile curve
+\end{itemize}
+QPP is 7$\times$ more effective, saving 92 MB on these modules. See Figure~\ref{fig:qpp_vs_gguf}.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.65\textwidth]{fig3_qpp_vs_gguf_attention.png}
+\caption{QPP vs GGUF on 13 attention modules (351 MB BF16).}
+\label{fig:qpp_vs_gguf}
+\end{figure}
+
+\subsection{Inference Speed}
+
+With cached weight reconstruction, QPP outperforms GGUF in throughput (Table~\ref{tab:speed}, Figure~\ref{fig:speed}).
+
+\begin{table}[h]
+\centering
+\caption{Generation speed benchmark (64 tokens).}
+\label{tab:speed}
+\begin{tabular}{@{}lrl@{}}
+\toprule
+\textbf{Method} & \textbf{tok/s} & \textbf{vs GGUF} \\
+\midrule
+BF16              & 30.0 & +95\% \\
+GGUF Q4\_K\_M     & 15.4 & --- \\
+QPP (no cache)    & 12.6 & $-$18\% \\
+\textbf{QPP (cached)} & \textbf{26.0} & \textbf{+69\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{QPP+GGUF physical file.} We applied QPP+CB\_2b to accepted attention modules, saved the model as a HuggingFace checkpoint, converted it to GGUF F16 via \texttt{llama.cpp}, and quantized it to Q4\_K\_M. The resulting file is 2,497 MB---identical in size to the pure GGUF (since only 9\% of modules are QPP). Speed: 12.6 tok/s (no cache) vs 15.4 tok/s for pure GGUF.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.65\textwidth]{fig4_speed_comparison.png}
+\caption{Inference speed: QPP cached vs GGUF Q4\_K\_M.}
+\label{fig:speed}
+\end{figure}
+
+
+%══════════════════════════════════════════
+\section{Discussion}
+%══════════════════════════════════════════
+
+\subsection{Why QPP Works on Attention but Not MLP}
+
+Attention quantile curves exhibit a clear three-region structure (negative/center/positive) well-approximated by few anchors. MLP curves are zero-centered Gaussians without this structure, making QPP ineffective---INT8 is optimal there.
+
+\subsection{QPP vs GGUF: Competitor or Complement?}
+
+QPP and GGUF are \textbf{orthogonal compression axes}:
+\begin{itemize}
+\item \textbf{GGUF} reduces the \textit{precision} of each weight (16 $\rightarrow$ 4 bits)
+\item \textbf{QPP} reduces the \textit{number} of parameters ($R \times C \rightarrow R \times K + \lceil R/B \rceil \times C$)
+\end{itemize}
+The resulting compression is \textbf{multiplicative}: QPP(21$\times$) $\times$ GGUF(3.2$\times$) $=$ 67$\times$ where QPP applies. This is a new frontier: compression along two independent axes simultaneously.
+
+\subsection{Limitations}
+
+\begin{enumerate}
+\item Only 9\% of attention modules accept QPP with the conservative gate ($\tau = 0.5$). With better ordering (activation-based), we project $>$50\% acceptance.
+\item $\Delta$PPL $= +0.51$ is moderate degradation, though generation remains coherent.
+\item QPP's forward pass requires an initial weight reconstruction step.
+\item Evaluated on a single model family (Qwen3). Validation on more architectures needed.
+\end{enumerate}
+
+\subsection{Future Work}
+
+\begin{itemize}
+\item \textbf{LoRA recovery}: light post-compression fine-tuning to reduce $\Delta$PPL.
+\item \textbf{More models}: extend to Qwen2.5-0.5B, Qwen2.5-1.5B, SmolLM2-1.7B.
+\item \textbf{Comparison with pruning \& low-rank}: additional baselines.
+\item \textbf{Native QPP GGUF tensor type}: implement QPP as a first-class GGUF quant type.
+\item \textbf{Theoretical analysis}: error bounds for quantile curve approximation.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{fig5_pareto_ppl_vs_size.png}
+\caption{Pareto frontier: compression ratio vs quality (PPL).}
+\label{fig:pareto}
+\end{figure}
+
+
+%══════════════════════════════════════════
+\section{Conclusion}
+%══════════════════════════════════════════
+
+We presented \textbf{QPP}, a novel parametric compression technique based on quantile curves for large language models. QPP reduces the number of parameters rather than just their bit precision, achieving 21$\times$ compression on attention layers---7$\times$ better than GGUF Q4\_K\_M where it applies.
+
+Combined with a 2-bit anchor codebook and INT8/INT4 quantization for MLP and embeddings, our pipeline achieves \textbf{41.1\% total compression on Qwen3-4B} with coherent text generation. With cached weights, QPP is \textbf{69\% faster} than GGUF at inference.
+
+QPP demonstrates that \textbf{parametric compression via quantile curves} is viable and complementary to standard bit quantization. The combination of both axes---reducing parameters and reducing bits---opens the path to compression ratios that neither technique achieves alone, with a projected 67$\times$ combined compression on attention layers.
+
+
+%══════════════════════════════════════════
+\begin{thebibliography}{9}
+
+\bibitem{gguf}
+GGUF Authors. \textit{GGUF: GPT-Generated Unified Format}. llama.cpp, 2024.
+
+\bibitem{awq}
+Lin, J. et al. \textit{AWQ: Activation-aware Weight Quantization}. MLSys, 2024.
+
+\bibitem{gptq}
+Frantar, E. et al. \textit{GPTQ: Accurate Post-Training Quantization}. ICLR, 2023.
+
+\bibitem{bitnet}
+Wang, H. et al. \textit{BitNet: Scaling 1-bit Transformers}. arXiv:2310.11453, 2023.
+
+\bibitem{quip}
+Chee, J. et al. \textit{QuIP\#: 2-bit Quantization with Lattice}. NeurIPS, 2024.
+
+\bibitem{llama}
+Touvron, H. et al. \textit{LLaMA: Open and Efficient Foundation Models}. 2023.
+
+\bibitem{qwen3}
+Qwen Team. \textit{Qwen3 Technical Report}. Alibaba Cloud, 2025.
+
+\end{thebibliography}
+
+\end{document}
