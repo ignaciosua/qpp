@@ -7,9 +7,13 @@ via Gumbel-Softmax as a differentiable proxy for permutation.
 Research question: does the quantile curve structure emerge naturally
 during training, or is it an artifact of pretrained weight statistics?
 
-ponytail: prototype — O(C²) per block for Gumbel-Softmax, only viable for
-small C (d_model ≤ 256). Upgrade path: low-rank factorized permutation,
-Sinkhorn normalization, or Hungarian straight-through estimator.
+Classes:
+  GumbelQPPLinear        — full-rank order_logits (O(C²), d_model ≤ 256)
+  LowRankGumbelQPPLinear — factorized U@V.T (O(C×R), scales to d=768+)
+
+ponytail: LowRankGumbelQPPLinear with R=16 drops memory 25× vs full-rank
+for d_model=768. Upgrade path: Sinkhorn normalization, shared U/V across
+Q/K/V/O, gradient checkpointing.
 """
 
 from __future__ import annotations
@@ -24,16 +28,10 @@ from qpp.compression import interp_basis
 
 
 class GumbelQPPLinear(nn.Module):
-    """Linear layer where weights are stored as QPP anchors + learned column ordering.
+    """QPP with learned column ordering via Gumbel-Softmax.
 
-    Forward pass:
-      1. Gumbel-Softmax: soft_perm = gumbel_softmax(order_logits)
-      2. Reorder activations: x_ordered = x @ soft_perm.T
-      3. Interpolate: z = x_ordered @ basis   (basis from interp_basis)
-      4. Project: out = z @ anchors.T
-
-    At the end of training, soft_perm is discretized to a hard permutation
-    for inference (no Gumbel noise).
+    ponytail: O(C²) per block for order_logits. Use LowRankGumbelQPPLinear
+    for d_model > 256.
     """
 
     def __init__(
@@ -56,87 +54,57 @@ class GumbelQPPLinear(nn.Module):
         rows, cols = out_features, in_features
         blocks = int(math.ceil(rows / row_block))
 
-        # Per-block learnable ordering logits: (blocks, cols, cols)
-        # order_logits[b, i, j] = logit for column i being at position j in block b
         self.order_logits = nn.Parameter(torch.randn(blocks, cols, cols) * 0.01)
-
-        # Learnable anchors: (rows, anchors)
         self.anchor_values = nn.Parameter(torch.randn(rows, anchors) * 0.02)
-
-        # Fixed interpolation basis: (cols, anchors)
         basis_np = interp_basis(cols, anchors)
         self.register_buffer("basis", torch.from_numpy(basis_np).float())
 
-        if bias:
-            self.bias_param = nn.Parameter(torch.zeros(rows))
-        else:
-            self.bias_param = None
-
-        # Temperature (can be annealed externally)
+        self.bias_param = nn.Parameter(torch.zeros(rows)) if bias else None
         self.register_buffer("temperature", torch.tensor(temp_init))
-
         self.row_slices = [
             (b * row_block, min((b + 1) * row_block, rows)) for b in range(blocks)
         ]
 
+    def _get_logits(self, block_id: int) -> torch.Tensor:
+        """Override in LowRankGumbelQPPLinear for factorized variant."""
+        return self.order_logits[block_id]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with soft permutation.
-
-        Args:
-            x: (..., in_features)
-
-        Returns:
-            (..., out_features)
-        """
         original_shape = x.shape[:-1]
         x_flat = x.reshape(-1, self.in_features)
-
-        out = torch.empty(
-            x_flat.shape[0], self.out_features,
-            device=x.device, dtype=x.dtype,
-        )
+        out = torch.empty(x_flat.shape[0], self.out_features, device=x.device, dtype=x.dtype)
 
         for block_id, (start, end) in enumerate(self.row_slices):
-            # Gumbel-Softmax permutation for this block
-            logits = self.order_logits[block_id]  # (C, C)
+            logits = self._get_logits(block_id)
             soft_perm = F.gumbel_softmax(logits, tau=self.temperature, hard=False, dim=-1)
-            # soft_perm[k, j] ≈ P(col k goes to position j)
-            # x_ordered[n, k] = Σ_j x[n, j] · soft_perm[j, k] = (x @ soft_perm)[n, k]
-            x_ordered = x_flat @ soft_perm  # (N, C)
-
-            # Interpolate: (N, C) @ (C, K) = (N, K)
+            x_ordered = x_flat @ soft_perm
             z = x_ordered @ self.basis.to(dtype=x_flat.dtype)
-
-            # Project: (N, K) @ (K, block_rows) = (N, block_rows)
-            block_anchors = self.anchor_values[start:end].to(dtype=x_flat.dtype)  # (R_b, K)
+            block_anchors = self.anchor_values[start:end].to(dtype=x_flat.dtype)
             out[:, start:end] = z @ block_anchors.T
 
         if self.bias_param is not None:
             out = out + self.bias_param.to(dtype=x.dtype)
-
         return out.reshape(*original_shape, self.out_features)
 
     def hard_permutation(self) -> torch.Tensor:
-        """Discretize to hard permutation for inference (no Gumbel noise).
+        """Discretize to hard permutation via greedy assignment per block.
 
         Returns (blocks, C) where position k maps to original column index.
-        Uses greedy column-to-position assignment with tiebreaking.
-        ponytail: O(C²) greedy per block. Upgrade path: Hungarian / Sinkhorn.
         """
         with torch.no_grad():
-            B, C = self.order_logits.shape[0], self.in_features
-            hard = torch.empty(B, C, dtype=torch.long, device=self.order_logits.device)
+            B, C = len(self.row_slices), self.in_features
+            device = self.order_logits.device
+            hard = torch.empty(B, C, dtype=torch.long, device=device)
             for b in range(B):
-                logits = self.order_logits[b]  # (C, C)
-                best_pos = torch.argmax(logits, dim=-1)  # (C,)
-                conf = logits[torch.arange(C, device=logits.device), best_pos]
+                logits = self._get_logits(b)
+                best_pos = torch.argmax(logits, dim=-1)
+                conf = logits[torch.arange(C, device=device), best_pos]
                 _, col_order = torch.sort(conf, descending=True)
-                assigned = torch.full((C,), -1, dtype=torch.long, device=logits.device)
+                assigned = torch.full((C,), -1, dtype=torch.long, device=device)
                 for col in col_order:
                     pos = best_pos[col].item()
                     if assigned[pos] == -1:
                         assigned[pos] = col.item()
-                # Fill remaining: unassigned columns → unassigned positions
                 unassigned = (assigned == -1).nonzero(as_tuple=True)[0]
                 cols_left = [c for c in range(C) if c not in assigned.tolist()]
                 for pos, col in zip(unassigned.tolist(), cols_left):
@@ -145,27 +113,111 @@ class GumbelQPPLinear(nn.Module):
             return hard
 
     def get_dense_weight(self) -> torch.Tensor:
-        """Materialize the equivalent dense weight matrix (for analysis)."""
+        """Materialize equivalent dense weight matrix (for analysis only)."""
         with torch.no_grad():
-            hard = self.hard_permutation()  # (blocks, C)
+            hard = self.hard_permutation()
             rows, cols = self.out_features, self.in_features
             weight = torch.empty(rows, cols, device=self.anchor_values.device)
             for block_id, (start, end) in enumerate(self.row_slices):
-                order = hard[block_id]  # (C,)
+                order = hard[block_id]
                 inv_order = torch.empty_like(order)
                 inv_order[order] = torch.arange(cols, device=order.device)
-                anchors = self.anchor_values[start:end]  # (R_b, K)
-                rec_sorted = self.basis.to(anchors.device) @ anchors.T  # (C, R_b)
+                anchors = self.anchor_values[start:end]
+                rec_sorted = self.basis.to(anchors.device) @ anchors.T
                 weight[start:end] = rec_sorted.T[:, inv_order]
             if self.bias_param is not None:
                 return weight, self.bias_param
             return weight, None
 
     def compression_ratio(self) -> float:
-        """Parametric compression vs dense BF16."""
         rows, cols = self.out_features, self.in_features
         dense_bytes = rows * cols * 2
-        qpp_bytes = rows * self.anchors_k * 2  # anchors
-        qpp_bytes += self.order_logits.numel() * 4  # logits (fp32 during training)
-        qpp_bytes += (self.bias_param.numel() * 2 if self.bias_param is not None else 0)
+        qpp_bytes = rows * self.anchors_k * 2
+        qpp_bytes += self.order_logits.numel() * 4
+        if self.bias_param is not None:
+            qpp_bytes += self.bias_param.numel() * 2
+        return dense_bytes / max(1, qpp_bytes)
+
+
+class LowRankGumbelQPPLinear(GumbelQPPLinear):
+    """Low-rank GumbelQPP: order_logits ≈ U @ V.T → O(C×R) vs O(C²).
+
+    For d_model=768 and R=16: 24K floats/block vs 590K → 25× less memory.
+    Enables scaling to real models like GPT-2 124M.
+
+    ponytail: R=16 is conservative. Upgrade path: Sinkhorn normalization,
+    shared U/V across Q/K/V/O of the same layer.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        anchors: int = 8,
+        row_block: int = 16,
+        bias: bool = True,
+        temp_init: float = 1.0,
+        temp_min: float = 0.1,
+        perm_rank: int = 16,
+    ):
+        # Skip GumbelQPPLinear.__init__ — build manually
+        nn.Module.__init__(self)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.anchors_k = anchors
+        self.row_block = row_block
+        self.temp_min = temp_min
+        self.perm_rank = perm_rank
+
+        rows, cols = out_features, in_features
+        blocks = int(math.ceil(rows / row_block))
+
+        # Low-rank: U, V of shape (blocks, cols, rank) → logits = U @ V.T
+        self.order_U = nn.Parameter(torch.randn(blocks, cols, perm_rank) * 0.01)
+        self.order_V = nn.Parameter(torch.randn(blocks, cols, perm_rank) * 0.01)
+        self.order_logits = None  # kept as None for compatibility with parent methods
+
+        self.anchor_values = nn.Parameter(torch.randn(rows, anchors) * 0.02)
+        basis_np = interp_basis(cols, anchors)
+        self.register_buffer("basis", torch.from_numpy(basis_np).float())
+
+        self.bias_param = nn.Parameter(torch.zeros(rows)) if bias else None
+        self.register_buffer("temperature", torch.tensor(temp_init))
+        self.row_slices = [
+            (b * row_block, min((b + 1) * row_block, rows)) for b in range(blocks)
+        ]
+
+    def _get_logits(self, block_id: int) -> torch.Tensor:
+        return self.order_U[block_id] @ self.order_V[block_id].T
+
+    def hard_permutation(self) -> torch.Tensor:
+        """Same greedy assignment but using U @ V.T on-the-fly."""
+        with torch.no_grad():
+            B, C = len(self.row_slices), self.in_features
+            device = self.order_U.device
+            hard = torch.empty(B, C, dtype=torch.long, device=device)
+            for b in range(B):
+                logits = self._get_logits(b)
+                best_pos = torch.argmax(logits, dim=-1)
+                conf = logits[torch.arange(C, device=device), best_pos]
+                _, col_order = torch.sort(conf, descending=True)
+                assigned = torch.full((C,), -1, dtype=torch.long, device=device)
+                for col in col_order:
+                    pos = best_pos[col].item()
+                    if assigned[pos] == -1:
+                        assigned[pos] = col.item()
+                unassigned = (assigned == -1).nonzero(as_tuple=True)[0]
+                cols_left = [c for c in range(C) if c not in assigned.tolist()]
+                for pos, col in zip(unassigned.tolist(), cols_left):
+                    assigned[pos] = col
+                hard[b] = assigned
+            return hard
+
+    def compression_ratio(self) -> float:
+        rows, cols = self.out_features, self.in_features
+        dense_bytes = rows * cols * 2
+        qpp_bytes = rows * self.anchors_k * 2
+        qpp_bytes += (self.order_U.numel() + self.order_V.numel()) * 4
+        if self.bias_param is not None:
+            qpp_bytes += self.bias_param.numel() * 2
         return dense_bytes / max(1, qpp_bytes)
