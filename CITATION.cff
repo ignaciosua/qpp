@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "QPP: Parametric Compression via Quantile Curves for Large Language Models"
+authors:
+  - given-names: Ignacio Fernando
+    family-names: Suárez Hernández
+    email: ignaciosua.h@gmail.com
+doi: 10.5281/zenodo.21046683
+url: "https://github.com/ignaciosua/qpp"
+repository-code: "https://github.com/ignaciosua/qpp"
+date-released: 2026-06-29
+version: 1.0.0
+license: MIT
+type: software
+keywords:
+  - model compression
+  - weight quantization
+  - quantile perceptron
+  - LLM efficiency
+  - parametric compression
+  - pytorch
+  - deep learning
+abstract: >
+  QPP (Quantile Piecewise Perceptron) is a novel parametric compression technique
+  that reduces the number of parameters in neural network weight matrices rather
+  than just their bit precision. When perceptron weights are sorted, they form a
+  smooth monotonic quantile curve that can be approximated with a linear interpolation
+  basis of K anchors plus block-shared ordering. Combined with 2-bit codebook
+  quantization over anchors and INT8 for incompatible layers, QPP achieves 41.1%
+  compression on Qwen3-4B with coherent generation, and is 7× more effective than
+  GGUF Q4_K_M on attention layers where it applies.

@@ -54,7 +54,8 @@ qpp-benchmark = "qpp.benchmark:main_cli"
 [project.urls]
 Homepage = "https://github.com/ignaciosua/qpp"
 Repository = "https://github.com/ignaciosua/qpp.git"
-Paper = "https://github.com/ignaciosua/qpp/blob/main/paper/qpp_paper.pdf"
+Paper = "https://doi.org/10.5281/zenodo.21046683"
+DOI = "https://doi.org/10.5281/zenodo.21046683"
 
 [tool.setuptools.packages.find]
 where = ["src"]

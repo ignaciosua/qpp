@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![tests](https://github.com/ignaciosua/qpp/actions/workflows/tests.yml/badge.svg)](https://github.com/ignaciosua/qpp/actions)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21046683.svg)](https://doi.org/10.5281/zenodo.21046683)
 
 QPP exploits a previously untapped structure in LLM weight matrices: when you sort the weights of a perceptron (row of a `Linear` layer) from smallest to largest, they form a **smooth, monotonic quantile curve** with three distinct regions (negative tail, center near zero, positive tail). This curve is regular enough to be approximated by a **linear interpolation basis with K anchors** (K ≪ columns). Instead of storing R×C floats, QPP stores R×K anchors + block-shared ordering.
 
@@ -166,12 +167,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get involved.
 ## Citation
 
 ```bibtex
-@misc{suarez2026qpp,
-  title={QPP: Parametric Compression via Quantile Curves for Large Language Models},
-  author={Suárez Hernández, Ignacio Fernando},
-  year={2026},
-  month={6},
-  howpublished={\url{https://github.com/ignaciosua/qpp}},
+@software{suarez2026qpp,
+  author       = {Suárez Hernández, Ignacio Fernando},
+  title        = {QPP: Parametric Compression via Quantile Curves for Large Language Models},
+  year         = {2026},
+  month        = {6},
+  doi          = {10.5281/zenodo.21046683},
+  publisher    = {Zenodo},
+  url          = {https://github.com/ignaciosua/qpp},
 }
 ```
 
